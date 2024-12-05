@@ -1,0 +1,129 @@
+var StudyArea = ee.FeatureCollection("users/ZFX/China_grids_part3"); //我把研究区打散成1°*1°的格网，这个路径你自己替换一下
+var Boundary = ee.FeatureCollection("users/ZFX/Level_0102_adding");//河流最大边界buffer，提供一个初始的范围，提取水体频率在这个范围内提取；河流最大边界是过年期间咱们检查的，arcgis里面生成一个buffer就行（ps GEE也能做buffer，但是太慢，所以就在本地做好buffer上传）
+
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+
+  // Bits 10 and 11 are clouds and cirrus, respectively.
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+      .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+  return image.updateMask(mask).divide(10000);
+}//这个函数是Sentinel-2去云的函数
+function maskS2MNDWI(image) {
+  var mndwi = image.select('MNDWI');
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = mndwi.lt(0.5);
+
+  return image.updateMask(mask);
+}//按照MNDWI<0.5筛选
+
+function maskS2snow(image) {
+  var scl = image.select('SCL');
+
+  // Both flags should be set to zero, indicating clear conditions.
+  var mask = scl.neq(11);
+  
+  return image.updateMask(mask);
+}//去除冰雪的栅格，并不是全球都要用，青藏高原有雪的地方用这个就行
+
+function cal_MNDWI(image){
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+  return image.addBands(mndwi);
+}//计算MNDWI指数
+
+function cal_EVI(image){
+  var evi = image.expression("2.5 * (Band8 - Band4) / (Band8 + 6 * Band4 - 7.5 * Band2 + 1)",
+  {"Band2":image.select('B2'), "Band4":image.select('B4'), "Band8":image.select('B8')}).rename('EVI');
+  return image.addBands(evi);
+}//计算EVI指数
+
+function cal_NDVI(image){
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+}//计算NDVI指数
+
+function cal_slop(image){
+  var SRTMDEM = ee.Image('USGS/SRTMGL1_003');
+  var elevation = SRTMDEM.select('elevation');
+  var slop = ee.Terrain.slope(elevation);
+  return image.addBands(slop);
+}//计算坡度，并不是全球都要用，山区的地方用这个就行（这个是比较基础的操作，你有兴趣的话可以想办法创新一下，如何更准确的提取出山区的河流？）
+
+function calcWater(image) {
+  var MNDWI = image.select("MNDWI");
+  var NDVI = image.select("NDVI");
+  var EVI = image.select("EVI");
+  var water1 = MNDWI.gt(EVI).eq(1).selfMask().unmask();
+  var water2 = MNDWI.gt(NDVI).eq(1).selfMask().unmask();
+  var water3 = EVI.lt(0.1).selfMask().unmask();
+  var water4 = water1.or(water2).eq(1).selfMask().unmask();
+  var water = water4.and(water3).eq(1).selfMask().unmask();
+  return water;
+}//判别条件1
+function calcWater1(image) {
+  var MNDWI = image.select("MNDWI");
+  var NDVI = image.select("NDVI");
+  var EVI = image.select("EVI");
+  var SLOPE = image.select("slope");
+  var water1 = MNDWI.gt(EVI).eq(1).selfMask().unmask();
+  var water2 = MNDWI.gt(NDVI).eq(1).selfMask().unmask();
+  var water3 = EVI.lt(0.1).selfMask().unmask();
+  var water4 = water1.or(water2).eq(1).selfMask().unmask();
+  var water5 = water4.and(water3).eq(1).selfMask().unmask();
+  var water51 = MNDWI.lt(0.5).selfMask().unmask();//NDSI
+  var water52 = MNDWI.gt(-0.05).selfMask().unmask();//NDWI
+  var water6 = water5.and(water51).eq(1).selfMask().unmask();
+  var water7 = water6.and(water52).eq(1).selfMask().unmask();
+  var water71 = SLOPE.lt(15).selfMask().unmask();//DEM
+  var water = water7.and(water71).eq(1).selfMask().unmask();
+  return water;
+}//判别条件2（条件1效果不好的时候用条件2，这个也是参考其他人论文，你有兴趣可以创新一下，提出自己创新性的方法）
+
+function GoodQualityImage(image){
+  var GQ_Image = image.select('B3').gt(0).selfMask().unmask().rename('GQ_Image');
+  //var GQ_Image2 = image.select('MNDWI').lt(0.5).selfMask().unmask();
+  //var GQ_Image = GQ_Image1.and(GQ_Image2).eq(1).selfMask().unmask().rename('GQ_Image');
+  return GQ_Image.select('GQ_Image');
+}//统计有效观测数量，计算水体频率时候的分母
+
+for(var n = 10; n <= 10; n++){
+  var roi = StudyArea.filter(ee.Filter.eq("Id", n));
+  //Sentinel-2 SR数据去云
+  var s2Sr = ee.ImageCollection('COPERNICUS/S2_SR')
+                    .filterDate('2020-01-01', '2020-12-31')
+                    .filterBounds(roi)
+                    //.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
+                    .map(maskS2clouds);
+                    //.map(maskS2snow);
+
+  var Image_3Indices = s2Sr.map(cal_MNDWI).map(maskS2MNDWI).map(cal_EVI).map(cal_NDVI);//.map(cal_slop);
+  
+  var water_image = Image_3Indices.map(calcWater);
+  
+  var water_image = water_image.sum().divide(Image_3Indices.map(GoodQualityImage).sum()).clip(roi);
+  var water_image = water_image.updateMask(water_image.gt(0));//.clip(Boundary);
+  //var water_image = water_image.unmask(0).clip(roi);
+  //print(water_image);
+  //Map.addLayer(roi);
+  //Map.addLayer(Boundary);
+  //Map.addLayer(water_image, {min: 0, max: 1}, "water", true);
+
+  var water_image_8byte = water_image.multiply(100).ceil().cast({'MNDWI':'byte'},['MNDWI']);
+
+  Export.image.toDrive({
+    image: water_image_8byte, 
+    description: 'S2_' + String(n),
+    fileNamePrefix: 'S2_' + String(n), 
+    region: roi,
+    scale: 10,
+    maxPixels: 1e13,
+    crs:'EPSG:4326',
+    folder:"River_CN_adding1"
+  });
+}
